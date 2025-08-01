@@ -1,0 +1,6 @@
+networkx
+python-dotenv
+# For CosmosDB, you would need:
+# azure-cosmos
+# For advanced community detection like Leiden, you might need:
+# graspologic (Note: This can be complex to install and might have specific numpy/scipy versions. For simplicity, we'll use NetworkX's built-in community detection or a custom one if needed.)
