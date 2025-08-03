@@ -54,7 +54,15 @@ class Extractor:
         # Generate embedding for the text chunk
         chunk_embedding = self.llm_client.get_embedding(text_unit)
         if chunk_embedding:
-            self.vector_store.add_chunk_embedding(chunk_id, chunk_embedding)
+            self.vector_store.add_documents([
+                {
+                    "id": chunk_id,
+                    "text": text_unit,
+                    "embedding": chunk_embedding,
+                    "type": "text_unit"
+                    }
+                ])
+
         else:
             print(f"Warning: Could not generate embedding for chunk_id {chunk_id}.")
 

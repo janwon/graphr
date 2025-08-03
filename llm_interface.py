@@ -54,7 +54,7 @@ class LLMClient:
     A client to interact with an LLM, based on the provided Atlas class structure
     and using Azure OpenAI.
     """
-    def __init__(self, api_key: str, model_name: str = "gpt-4o",
+    def __init__(self, api_key: str, model_name: str = "gpt-4o-mini-20240718-gs",
                  temperature: float = 0.3, max_output_tokens: int = 4096,
                  system_prompt: Optional[str] = None,
                  embedding_model_name: str = "text-embedding-ada-002"): # Added embedding model

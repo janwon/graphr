@@ -1,109 +1,168 @@
 import numpy as np
 import json
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional, Union
 import math
+from azure.cosmos import CosmosClient, exceptions # Import CosmosClient and exceptions
+
+# Define a simple Document class for structured return
+class Document:
+    def __init__(self, id: str, text: Optional[str] = None, embedding: Optional[List[float]] = None, score: Optional[float] = None, doc_type: Optional[str] = None):
+        self.id = id
+        self.text = text
+        self.embedding = embedding
+        self.score = score
+        self.type = doc_type
+
+    def __repr__(self):
+        return f"Document(id='{self.id}', type='{self.type}', score={self.score:.4f})"
 
 class VectorStoreManager:
     """
-    Manages the storage and retrieval of embeddings.
-    For simplicity, this is an in-memory vector store.
-    In a production system, this would be replaced by a dedicated vector database.
+    Manages the storage and retrieval of documents with embeddings, using CosmosDB
+    as the persistent vector store. This version supports separate source (read-only)
+    and destination (write-only) configurations.
     """
-    def __init__(self):
-        # Stores embeddings for different types of content
-        # Example: {"chunk_id": [embedding_vector], ...}
-        self.chunk_embeddings: Dict[str, List[float]] = {}
-        # Example: {"community_id": [embedding_vector], ...}
-        self.community_embeddings: Dict[str, List[float]] = {}
-        # You could add entity_embeddings as well: Dict[str, List[float]] = {}
-
-    def add_chunk_embedding(self, chunk_id: str, embedding: List[float]):
-        """Adds an embedding for a text chunk."""
-        if not isinstance(embedding, list) or not all(isinstance(x, (int, float)) for x in embedding):
-            print(f"Warning: Invalid embedding format for chunk_id {chunk_id}. Expected List[float]. Got: {type(embedding)}")
-            return
-        self.chunk_embeddings[chunk_id] = embedding
-        # print(f"Added embedding for chunk_id: {chunk_id}")
-
-    def add_community_embedding(self, community_id: str, embedding: List[float]):
-        """Adds an embedding for a community summary."""
-        if not isinstance(embedding, list) or not all(isinstance(x, (int, float)) for x in embedding):
-            print(f"Warning: Invalid embedding format for community_id {community_id}. Expected List[float]. Got: {type(embedding)}")
-            return
-        self.community_embeddings[str(community_id)] = embedding # Ensure community_id is string for consistent dict keys
-        # print(f"Added embedding for community_id: {community_id}")
-
-    def cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        """Calculates the cosine similarity between two vectors."""
-        if not vec1 or not vec2:
-            return 0.0 # Handle empty vectors
-        
-        # Convert to numpy arrays for efficient calculation
-        np_vec1 = np.array(vec1)
-        np_vec2 = np.array(vec2)
-
-        dot_product = np.dot(np_vec1, np_vec2)
-        norm_vec1 = np.linalg.norm(np_vec1)
-        norm_vec2 = np.linalg.norm(np_vec2)
-
-        if norm_vec1 == 0 or norm_vec2 == 0:
-            return 0.0 # Avoid division by zero
-        
-        return dot_product / (norm_vec1 * norm_vec2)
-
-    def search_chunks(self, query_embedding: List[float], top_k: int = 3) -> List[Tuple[str, float]]:
+    def __init__(self, source_cosmosdb_conn_str: str, source_cosmosdb_db_name: str, source_cosmosdb_container_name: str, dest_cosmosdb_conn_str: Optional[str] = None, dest_cosmosdb_db_name: Optional[str] = None, dest_cosmosdb_container_name: Optional[str] = None):
         """
-        Performs a similarity search over chunk embeddings.
-        Returns a list of (chunk_id, similarity_score) tuples, sorted by score.
+        Initializes the vector store with CosmosDB clients for source and destination.
+        
+        Args:
+            source_cosmosdb_conn_str (str): The connection string for the source CosmosDB.
+            source_cosmosdb_db_name (str): The database name for the source CosmosDB.
+            source_cosmosdb_container_name (str): The container name for the source CosmosDB.
+            dest_cosmosdb_conn_str (Optional[str]): The connection string for the destination CosmosDB.
+            dest_cosmosdb_db_name (Optional[str]): The database name for the destination CosmosDB.
+            dest_cosmosdb_container_name (Optional[str]): The container name for the destination CosmosDB.
         """
-        if not query_embedding:
-            return []
+        self.source_container = self._initialize_cosmosdb_client(
+            source_cosmosdb_conn_str,
+            source_cosmosdb_db_name,
+            source_cosmosdb_container_name
+        )
+        self.dest_container = None
+        if all([dest_cosmosdb_conn_str, dest_cosmosdb_db_name, dest_cosmosdb_container_name]):
+            self.dest_container = self._initialize_cosmosdb_client(
+                dest_cosmosdb_conn_str,
+                dest_cosmosdb_db_name,
+                dest_cosmosdb_container_name
+            )
+
+    def _initialize_cosmosdb_client(self, conn_str: str, db_name: str, container_name: str):
+        """Helper to create and return a CosmosDB container client."""
+        try:
+            client = CosmosClient.from_connection_string(conn_str)
+            database = client.get_database_client(db_name)
+            container = database.get_container_client(container_name)
+            print(f"Successfully connected to CosmosDB container: '{container_name}' in database: '{db_name}'")
+            return container
+        except exceptions.CosmosHttpResponseError as e:
+            print(f"Error connecting to CosmosDB container '{container_name}': {e}")
+            raise
+        except Exception as e:
+            print(f"An unexpected error occurred while connecting to CosmosDB: {e}")
+            raise
+
+    def add_documents(self, documents: List[Dict[str, Any]]):
+        """
+        Adds multiple documents (with their embeddings) to the destination vector store.
+        Each document dict should have at least 'id' and 'embedding'.
+        It can also have 'text' for richer storage.
+        """
+        if not self.dest_container:
+            print("Error: Destination CosmosDB container not configured. Cannot add documents.")
+            return
+
+        for doc in documents:
+            doc_id = doc.get("id")
+            if not doc_id:
+                print("Warning: Document without an 'id' cannot be added. Skipping.")
+                continue
+
+            try:
+                # Use upsert_item to create or update the document
+                self.dest_container.upsert_item(body=doc)
+                # print(f"Upserted document with id: {doc_id}")
+            except exceptions.CosmosHttpResponseError as e:
+                print(f"Error upserting document {doc_id} to CosmosDB: {e}")
+            except Exception as e:
+                print(f"An unexpected error occurred adding document {doc_id}: {e}")
+    
+    def get_all_stored_data(self, doc_type: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Retrieves all documents from the source CosmosDB container.
+        
+        Args:
+            doc_type (Optional[str]): Filters documents by a 'type' property if provided.
+        
+        Returns:
+            Dict[str, Any]: A dictionary of document IDs to their data.
+        """
+        if not self.source_container:
+            print("Error: Source CosmosDB container not configured. Cannot retrieve data.")
+            return {}
+        
+        query = "SELECT * FROM c"
+        if doc_type:
+            query = f"SELECT * FROM c WHERE c.type = '{doc_type}'"
+            
+        stored_documents = {}
+        try:
+            for item in self.source_container.query_items(query=query, enable_cross_partition_query=True):
+                stored_documents[item['id']] = item
+            print(f"Successfully retrieved {len(stored_documents)} documents from source.")
+        except exceptions.CosmosHttpResponseError as e:
+            print(f"Error querying CosmosDB: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred during data retrieval: {e}")
+        return stored_documents
+
+    def search_documents(self, query_embedding: List[float], top_k: int = 5, doc_type: Optional[str] = None) -> List[Document]:
+        """
+        Performs a cosine similarity search on stored documents in the source container.
+        
+        Args:
+            query_embedding (List[float]): The embedding of the search query.
+            top_k (int): The number of top results to return.
+            doc_type (Optional[str]): Filters search to a specific document type.
+            
+        Returns:
+            List[Document]: A list of Document objects sorted by similarity score.
+        """
+        # Note: This is an in-memory search on all retrieved documents.
+        # For a production system, this would be replaced by native vector search capabilities.
+        stored_documents = self.get_all_stored_data(doc_type=doc_type)
 
         similarities = []
-        for chunk_id, emb in self.chunk_embeddings.items():
-            score = self.cosine_similarity(query_embedding, emb)
-            similarities.append((chunk_id, score))
-        
+        for doc_id, doc_data in stored_documents.items():
+            embedding = doc_data.get("embedding")
+            if embedding:
+                score = self.cosine_similarity(query_embedding, embedding)
+                similarities.append(Document(id=doc_id, text=doc_data.get("text"), embedding=embedding, score=score, doc_type=doc_data.get("type")))
+
         # Sort by score in descending order
-        similarities.sort(key=lambda x: x[1], reverse=True)
+        similarities.sort(key=lambda x: x.score, reverse=True)
         return similarities[:top_k]
 
-    def search_communities(self, query_embedding: List[float], top_k: int = 3) -> List[Tuple[str, float]]:
-        """
-        Performs a similarity search over community embeddings.
-        Returns a list of (community_id, similarity_score) tuples, sorted by score.
-        """
-        if not query_embedding:
-            return []
-
-        similarities = []
-        for community_id, emb in self.community_embeddings.items():
-            score = self.cosine_similarity(query_embedding, emb)
-            similarities.append((community_id, score))
-        
-        # Sort by score in descending order
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:top_k]
-
-    def get_all_embeddings(self) -> Dict[str, Any]:
-        """Returns all stored embeddings."""
-        return {
-            "chunk_embeddings": self.chunk_embeddings,
-            "community_embeddings": self.community_embeddings
-        }
+    def cosine_similarity(self, a: List[float], b: List[float]) -> float:
+        """Computes the cosine similarity between two vectors."""
+        dot_product = np.dot(a, b)
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot_product / (norm_a * norm_b)
 
     def load_embeddings_from_file(self, file_path: str):
-        """Loads embeddings from a JSON file."""
+        """Loads embeddings from a JSON file. This method is retained for compatibility."""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                self.chunk_embeddings = data.get("chunk_embeddings", {})
-                self.community_embeddings = data.get("community_embeddings", {})
-            print(f"Embeddings loaded from {file_path}")
+                # In a persistent setup, this would load into memory, but
+                # we'll assume CosmosDB is the source of truth for this version.
+                print(f"Embeddings loaded from {file_path}. Note: This version of the VectorStoreManager uses CosmosDB as the primary source.")
         except FileNotFoundError:
-            print(f"Embeddings file not found: {file_path}. Starting with empty vector store.")
+            print(f"Embeddings file not found: {file_path}. Continuing with CosmosDB store.")
         except json.JSONDecodeError as e:
-            print(f"Error decoding JSON from embeddings file {file_path}: {e}. Starting with empty vector store.")
+            print(f"Error decoding JSON from embeddings file {file_path}: {e}.")
         except Exception as e:
-            print(f"An unexpected error occurred loading embeddings from {file_path}: {e}. Starting with empty vector store.")
-
+            print(f"An unexpected error occurred loading embeddings from {file_path}: {e}")
