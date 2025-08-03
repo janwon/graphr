@@ -1,3 +1,4 @@
+# File: test_processing_pipeline.py
 import os
 import sys
 import json
@@ -31,7 +32,7 @@ def run_processing_pipeline_tests():
     dest_cosmos_conn_str = os.getenv("GRAPHRAG_DEST_COSMOSDB_CONN_STR", source_cosmos_conn_str)
     dest_cosmos_db_name = os.getenv("GRAPHRAG_DEST_COSMOSDB_DB_NAME", source_cosmos_db_name)
     dest_text_unit_container_name = os.getenv("GRAPHRAG_DEST_TEXT_UNIT_CONTAINER", "text_units")
-    dest_extracted_data_container_name = os.getenv("GRAPHRAG_DEST_EXTRACTED_DATA_CONTAINER", "extracted_data")
+    dest_entity_container_name = os.getenv("GRAPHRAG_DEST_ENTITY_CONTAINER", "entities") # NEW: Dedicated container for entities
 
     # --- 1. Load Data ---
     print("\n--- Step 1: Loading Data from CosmosDB ---")
@@ -80,18 +81,18 @@ def run_processing_pipeline_tests():
         dest_cosmosdb_db_name=dest_cosmos_db_name,
         dest_cosmosdb_container_name=dest_text_unit_container_name
     )
-    extracted_data_vector_store = VectorStoreManager(
+    # NEW: Initialize a separate VectorStoreManager for entities
+    entity_vector_store = VectorStoreManager(
         source_cosmos_conn_str,
         source_cosmos_db_name,
         source_cosmos_container_name,
         dest_cosmosdb_conn_str=dest_cosmos_conn_str,
         dest_cosmosdb_db_name=dest_cosmos_db_name,
-        dest_cosmosdb_container_name=dest_extracted_data_container_name
+        dest_cosmosdb_container_name=dest_entity_container_name
     )
-
-    # --- 3. Extract Entities, Relationships, and Claims from Chunks ---
-    print("\n--- Step 3: Extracting Entities, Relationships, and Claims from Chunks ---")
-    extractor = Extractor(llm_client, config.processing.entity_extraction_prompt, text_unit_vector_store)
+    
+    # NEW: Pass both vector stores to the extractor
+    extractor = Extractor(llm_client, config.processing.entity_extraction_prompt, text_unit_vector_store, entity_vector_store)
     graph_builder = GraphBuilder()
 
     extracted_data_samples = []
@@ -99,78 +100,55 @@ def run_processing_pipeline_tests():
     # Test only first 2 chunks for extraction to save tokens/time
     num_chunks_to_test = min(len(text_chunks_with_ids), 2) 
 
-    # Prepare a list of documents to add to the text unit vector store
-    text_unit_docs_to_add = []
-
     for i in range(num_chunks_to_test):
         chunk_id, chunk_text = text_chunks_with_ids[i]
         print(f"\n--- Extracting from Chunk {i+1}/{len(text_chunks_with_ids)} (ID: {chunk_id}) ---")
         print(f"Chunk content preview: '{chunk_text[:100]}...'") # Show a snippet of the chunk
 
         try:
-            # Generate embedding for the chunk and prepare the document for the vector store
-            print("Generating embedding for chunk...")
-            chunk_embedding = llm_client.get_embedding(chunk_text)
-            if chunk_embedding:
-                text_unit_docs_to_add.append({
-                    "id": chunk_id,
-                    "text": chunk_text,
-                    "embedding": chunk_embedding,
-                    "type": "text_unit"
-                })
-                print("Generated embedding and prepared document.")
-            else:
+            # NEW: Store text unit and get embedding first
+            print("Generating embedding for chunk and storing text unit...")
+            chunk_id, chunk_embedding = extractor.extract_and_store_text_unit(chunk_id, chunk_text)
+            if not chunk_embedding:
                 print(f"Warning: Failed to generate embedding for chunk {chunk_id}. Skipping.")
                 continue
 
-            # Pass chunk_id to the extractor method
-            extracted_data = extractor.extract_entities_relationships_claims(chunk_id, chunk_text)
+            # NEW: Extract entities and other data from the text unit
+            extracted_data = extractor.extract_entities_relationships_claims(chunk_text)
           
             if extracted_data:
                 print(f"Extracted Data for Chunk {i+1}:")
-                
+                # NEW: Convert extracted_data to a dictionary, handling both Pydantic model and dict cases
                 if isinstance(extracted_data, dict):
                     extracted_data_dict = extracted_data
                 elif hasattr(extracted_data, 'model_dump'):
                     extracted_data_dict = extracted_data.model_dump()
-                elif hasattr(extracted_data, 'dict'):
-                    extracted_data_dict = extracted_data.dict()
                 else:
                     extracted_data_dict = {}
 
                 print(json.dumps(extracted_data_dict, indent=2))
                 extracted_data_samples.append(extracted_data_dict)
 
+                # NEW: Dedupe and store entities individually
+                print("Deduping and storing entities...")
+                extractor.dedupe_and_store_entities(extracted_data_dict, chunk_id, chunk_embedding)
+                
                 # Add the extracted data to the graph builder
-                # The GraphBuilder should have an 'add_extracted_data' method
-                # If it doesn't, this line will cause the error.
-                # Assuming the method exists based on the original code's intent.
                 graph_builder.add_extracted_data_to_graph(extracted_data_dict)
-
-                # Store the extracted data in its own vector store
-                extracted_data_vector_store.add_documents([
-                    {
-                        "id": f"extracted_data_{chunk_id}",
-                        "text": json.dumps(extracted_data_dict),
-                        "embedding": chunk_embedding, # Using the same embedding as the chunk for simplicity
-                        "type": "extracted_data"
-                    }
-                ])
-                print(f"Stored extracted data for chunk {chunk_id} in '{dest_extracted_data_container_name}'.")
 
             else:
                 print(f"Extraction failed for Chunk {i+1}. Check LLM client logs for errors.")
             
         except Exception as e:
             print(f"Error during vector production/storage/retrieval for Chunk {i+1}: {e}")
+            raise # Re-raise the exception to see the full traceback
         
         # Add a small delay to avoid hitting rate limits for LLM calls
         time.sleep(1) # Uncomment if facing rate limits
 
-    # Now, add all the prepared text unit documents to the vector store at once
-    print(f"\n--- Adding all {len(text_unit_docs_to_add)} text unit documents to CosmosDB ---")
-    text_unit_vector_store.add_documents(text_unit_docs_to_add)
-    print(f"Documents successfully added to '{dest_text_unit_container_name}'.")
+    print(f"\n--- Adding all {num_chunks_to_test} text unit documents to CosmosDB ---")
+    # Note: text units are now added one by one inside the loop by the extractor
+    print(f"Documents successfully processed and added to '{dest_text_unit_container_name}'.")
 
     # --- 4. Build the Knowledge Graph ---
     print("\n--- Step 4: Building Knowledge Graph from extracted data ---")
@@ -195,14 +173,14 @@ def run_processing_pipeline_tests():
     else:
         print(f"No documents found in '{dest_text_unit_container_name}'.")
 
-    # Verify extracted data documents
-    all_extracted_data_docs = extracted_data_vector_store.get_all_stored_data()
-    if all_extracted_data_docs:
-        print(f"\nFound {len(all_extracted_data_docs)} documents in '{dest_extracted_data_container_name}':")
-        for doc_id, doc_data in all_extracted_data_docs.items():
+    # NEW: Verify entity documents
+    all_entity_docs = entity_vector_store.get_all_stored_data()
+    if all_entity_docs:
+        print(f"\nFound {len(all_entity_docs)} documents in '{dest_entity_container_name}':")
+        for doc_id, doc_data in all_entity_docs.items():
             print(f"- ID: {doc_id}, Type: {doc_data.get('type')}, Text Preview: '{doc_data.get('text', '')[:50]}...'")
     else:
-        print(f"No documents found in '{dest_extracted_data_container_name}'.")
+        print(f"No documents found in '{dest_entity_container_name}'.")
 
 
     print("\n--- Processing Pipeline Test Complete ---")
